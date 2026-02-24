@@ -7,6 +7,9 @@ export const botSettings = pgTable("bot_settings", {
   botToken: text("bot_token").notNull(),
   voiceChannelId: text("voice_channel_id").notNull(),
   isActive: boolean("is_active").default(false).notNull(),
+  presenceType: text("presence_type").default("PLAYING").notNull(), // PLAYING, LISTENING, WATCHING, COMPETING
+  presenceName: text("presence_name").default("").notNull(),
+  status: text("status").default("online").notNull(), // online, idle, dnd, invisible
 });
 
 export const insertBotSettingsSchema = createInsertSchema(botSettings).omit({ id: true });

@@ -3,7 +3,7 @@ import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { api, errorSchemas } from "@shared/routes";
 import { z } from "zod";
-import { startBot, stopBot, getBotStatus, initializeBotIfActive } from "./discord";
+import { startBot, stopBot, getBotStatus, initializeBotIfActive, updatePresence } from "./discord";
 
 export async function registerRoutes(
   httpServer: Server,
@@ -19,6 +19,10 @@ export async function registerRoutes(
     try {
       const input = api.settings.save.input.parse(req.body);
       const updated = await storage.saveSettings(input);
+      
+      // Update bot presence live if it's connected
+      updatePresence(updated);
+      
       res.json(updated);
     } catch (err) {
       if (err instanceof z.ZodError) {
