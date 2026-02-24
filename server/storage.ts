@@ -1,38 +1,31 @@
-import { type User, type InsertUser } from "@shared/schema";
-import { randomUUID } from "crypto";
-
-// modify the interface with any CRUD methods
-// you might need
+import { botSettings, type BotSettings, type InsertBotSettings } from "@shared/schema";
+import { db } from "./db";
+import { eq } from "drizzle-orm";
 
 export interface IStorage {
-  getUser(id: string): Promise<User | undefined>;
-  getUserByUsername(username: string): Promise<User | undefined>;
-  createUser(user: InsertUser): Promise<User>;
+  getSettings(): Promise<BotSettings | undefined>;
+  saveSettings(settings: InsertBotSettings): Promise<BotSettings>;
 }
 
-export class MemStorage implements IStorage {
-  private users: Map<string, User>;
-
-  constructor() {
-    this.users = new Map();
+export class DatabaseStorage implements IStorage {
+  async getSettings(): Promise<BotSettings | undefined> {
+    const [settings] = await db.select().from(botSettings).limit(1);
+    return settings;
   }
 
-  async getUser(id: string): Promise<User | undefined> {
-    return this.users.get(id);
-  }
-
-  async getUserByUsername(username: string): Promise<User | undefined> {
-    return Array.from(this.users.values()).find(
-      (user) => user.username === username,
-    );
-  }
-
-  async createUser(insertUser: InsertUser): Promise<User> {
-    const id = randomUUID();
-    const user: User = { ...insertUser, id };
-    this.users.set(id, user);
-    return user;
+  async saveSettings(settings: InsertBotSettings): Promise<BotSettings> {
+    const existing = await this.getSettings();
+    if (existing) {
+      const [updated] = await db.update(botSettings)
+        .set(settings)
+        .where(eq(botSettings.id, existing.id))
+        .returning();
+      return updated;
+    } else {
+      const [inserted] = await db.insert(botSettings).values(settings).returning();
+      return inserted;
+    }
   }
 }
 
-export const storage = new MemStorage();
+export const storage = new DatabaseStorage();
