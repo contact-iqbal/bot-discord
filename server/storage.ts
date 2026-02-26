@@ -1,13 +1,41 @@
-import { botSettings, type BotSettings, type InsertBotSettings } from "@shared/schema";
+import { botSettings, type BotSettings, type InsertBotSettings, users, type User, type InsertUser, guildSettings, type GuildSettings, type InsertGuildSettings } from "@shared/schema";
 import { db } from "./db";
 import { eq } from "drizzle-orm";
+import session from "express-session";
+import connectPg from "connect-pg-simple";
+import { pool } from "./db";
+
+const PostgresSessionStore = connectPg(session);
 
 export interface IStorage {
   getSettings(): Promise<BotSettings | undefined>;
   saveSettings(settings: InsertBotSettings): Promise<BotSettings>;
+  updateActiveStatus(isActive: boolean): Promise<void>;
+  
+  // User operations
+  getUser(id: number): Promise<User | undefined>;
+  getUserByDiscordId(discordId: string): Promise<User | undefined>;
+  createUser(user: InsertUser): Promise<User>;
+  updateUser(id: number, user: Partial<InsertUser>): Promise<User>;
+  
+  // Guild Settings
+  getGuildSettings(guildId: string): Promise<GuildSettings | undefined>;
+  updateGuildSettings(guildId: string, settings: Partial<InsertGuildSettings>): Promise<GuildSettings>;
+
+  sessionStore: session.Store;
 }
 
 export class DatabaseStorage implements IStorage {
+  sessionStore: session.Store;
+
+  constructor() {
+    this.sessionStore = new PostgresSessionStore({
+      pool,
+      createTableIfMissing: false, // Set to false to prevent looking for table.sql
+      tableName: "session",
+    });
+  }
+
   async getSettings(): Promise<BotSettings | undefined> {
     const [settings] = await db.select().from(botSettings).limit(1);
     return settings;
@@ -23,6 +51,61 @@ export class DatabaseStorage implements IStorage {
       return updated;
     } else {
       const [inserted] = await db.insert(botSettings).values(settings).returning();
+      return inserted;
+    }
+  }
+
+  async updateActiveStatus(isActive: boolean): Promise<void> {
+    const existing = await this.getSettings();
+    if (existing) {
+      await db.update(botSettings)
+        .set({ isActive })
+        .where(eq(botSettings.id, existing.id));
+    }
+  }
+
+  // User operations
+  async getUser(id: number): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user;
+  }
+
+  async getUserByDiscordId(discordId: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.discordId, discordId));
+    return user;
+  }
+
+  async createUser(user: InsertUser): Promise<User> {
+    const [inserted] = await db.insert(users).values(user).returning();
+    return inserted;
+  }
+
+  async updateUser(id: number, user: Partial<InsertUser>): Promise<User> {
+    const [updated] = await db.update(users)
+      .set(user)
+      .where(eq(users.id, id))
+      .returning();
+    return updated;
+  }
+
+  // Guild Settings
+  async getGuildSettings(guildId: string): Promise<GuildSettings | undefined> {
+    const [settings] = await db.select().from(guildSettings).where(eq(guildSettings.guildId, guildId));
+    return settings;
+  }
+
+  async updateGuildSettings(guildId: string, settings: Partial<InsertGuildSettings>): Promise<GuildSettings> {
+    const existing = await this.getGuildSettings(guildId);
+    if (existing) {
+      const [updated] = await db.update(guildSettings)
+        .set(settings)
+        .where(eq(guildSettings.guildId, guildId))
+        .returning();
+      return updated;
+    } else {
+      const [inserted] = await db.insert(guildSettings)
+        .values({ guildId, ...settings } as any)
+        .returning();
       return inserted;
     }
   }

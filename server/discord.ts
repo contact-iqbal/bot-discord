@@ -1,10 +1,39 @@
-import { Client, GatewayIntentBits, ActivityType, PresenceStatusData } from "discord.js";
-import { joinVoiceChannel, getVoiceConnection } from "@discordjs/voice";
+import { Client, GatewayIntentBits, ActivityType, PresenceStatusData, EmbedBuilder, TextChannel, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, StringSelectMenuBuilder } from "discord.js";
+import { joinVoiceChannel, getVoiceConnection, VoiceConnectionStatus, entersState } from "@discordjs/voice";
 import { storage } from "./storage";
+import { MusicManager } from "./music";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 let client: Client | null = null;
 let currentStatus: "disconnected" | "connecting" | "connected" | "error" = "disconnected";
 let errorMessage: string | undefined = undefined;
+let responses: string[] = [];
+
+const BOT_TOKEN = process.env.DISCORD_TOKEN || "";
+const BOT_ID = "1475678249240494232";
+
+const HARDCODED_SETTINGS = {
+  presenceType: "STREAMING",
+  presenceName: "!help | Shania Gracia",
+  status: "online" as PresenceStatusData,
+  isActive: true,
+};
+
+function loadResponses() {
+  try {
+    const filePath = path.resolve(process.cwd(), "server", "responses.json");
+    const raw = readFileSync(filePath, "utf-8");
+    const parsed = JSON.parse(raw) as { responses: string[] };
+    if (Array.isArray(parsed.responses)) {
+      responses = parsed.responses;
+    }
+  } catch (e) {
+    console.error("Failed to load responses.json:", e);
+    responses = ["Halo!"]; // fallback minimal
+  }
+}
+loadResponses();
 
 export function getBotStatus() {
   return { status: currentStatus, errorMessage };
@@ -12,17 +41,15 @@ export function getBotStatus() {
 
 export async function initializeBotIfActive() {
   try {
-    const settings = await storage.getSettings();
-    if (settings && settings.isActive && settings.botToken && settings.voiceChannelId) {
-      console.log("Bot was active, attempting to reconnect...");
-      startBot(settings.botToken, settings.voiceChannelId).catch(console.error);
-    }
+    // Always start bot on initialization now as requested (Hardcoded isActive: true)
+    console.log("Initializing bot with hardcoded settings...");
+    startBot().catch(console.error);
   } catch (err) {
-    console.error("Failed to initialize bot from storage:", err);
+    console.error("Failed to initialize bot:", err);
   }
 }
 
-export async function startBot(token: string, channelId: string) {
+export async function startBot(channelId?: string) {
   if (client) {
     stopBot();
   }
@@ -34,31 +61,318 @@ export async function startBot(token: string, channelId: string) {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildVoiceStates,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
     ],
   });
 
   return new Promise<void>((resolve, reject) => {
+    client!.on("messageCreate", async (message) => {
+      if (message.author.bot) return;
+
+      // Get guild settings for custom prefix and permissions
+      let guildPrefix = "!";
+      if (message.guildId) {
+        try {
+          const gSettings = await storage.getGuildSettings(message.guildId);
+          if (gSettings) {
+            guildPrefix = gSettings.prefix || "!";
+
+            const userRoles = message.member?.roles.cache.map(r => r.id) || [];
+            
+            // Priority 1: Check Blocked Roles
+            const isBlocked = (gSettings.blockedRoles as string[]).some(roleId => userRoles.includes(roleId));
+            if (isBlocked) return;
+
+            // Priority 2: Check Allowed Roles (if list is not empty)
+            const allowedRoles = gSettings.allowedRoles as string[];
+            if (allowedRoles.length > 0) {
+              const isAllowed = allowedRoles.some(roleId => userRoles.includes(roleId));
+              if (!isAllowed) return;
+            }
+          }
+        } catch (err) {
+          console.error("Error checking guild settings:", err);
+        }
+      }
+
+      const content = message.content.toLowerCase();
+      
+      // Handle Prefix Commands
+      if (content.startsWith(guildPrefix)) {
+        const args = message.content.slice(guildPrefix.length).trim().split(/ +/);
+        const command = args.shift()?.toLowerCase();
+        
+        if (command === "play" || command === "p") {
+          const query = args.join(" ");
+
+          if (!query) {
+            message.reply(`Silakan masukkan judul lagu atau URL. Contoh: \`${guildPrefix}play Shania Gracia\``).catch(console.error);
+            return;
+          }
+
+          const voiceChannel = message.member?.voice.channel;
+          if (!voiceChannel) {
+            message.reply("Mohon maaf, Anda harus berada di dalam saluran suara untuk memutar musik.").catch(console.error);
+            return;
+          }
+
+          try {
+            // Ensure bot is connected
+            const connection = getVoiceConnection(message.guildId!);
+            if (!connection) {
+              await connectToVoice(voiceChannel.id, voiceChannel.guild.id, voiceChannel.guild.voiceAdapterCreator);
+            }
+
+            const music = MusicManager.getManager(message.guildId!);
+            music.setChannel(message.channel);
+
+            const searchResults = await MusicManager.search(query);
+
+            if (searchResults.length === 0) {
+              message.reply("Maaf, tidak dapat menemukan lagu tersebut di SoundCloud.").catch(console.error);
+              return;
+            }
+
+            const track = {
+              ...searchResults[0],
+              requestedBy: message.author.username,
+            };
+
+            await music.addToQueue(track, message.guildId!);
+          } catch (err: any) {
+            console.error("Play Command Error:", err.message);
+            message.reply(`❌ Terjadi kesalahan: ${err.message}`).catch(console.error);
+          }
+          return;
+        }
+
+        if (command === "search" || command === "s") {
+          const query = args.join(" ");
+
+          if (!query) {
+            message.reply(`Silakan masukkan judul lagu untuk dicari. Contoh: \`${guildPrefix}search Shania Gracia\``).catch(console.error);
+            return;
+          }
+
+          try {
+            const results = await MusicManager.search(query);
+            if (results.length === 0) {
+              message.reply(`Maaf, tidak dapat menemukan hasil pencarian di SoundCloud.`).catch(console.error);
+              return;
+            }
+
+            const embed = new EmbedBuilder()
+              .setColor("#FF5500")
+              .setTitle(`🔍 Hasil Pencarian SoundCloud: ${query}`)
+              .setDescription(results.map((r, i) => `**${i + 1}.** [${r.title}](${r.url}) | \`${r.duration}\``).join("\n"))
+              .setFooter({ text: `Gunakan ${guildPrefix}p [judul] untuk memutar.` });
+
+            message.reply({ embeds: [embed] }).catch(console.error);
+          } catch (err: any) {
+            message.reply(`❌ Gagal mencari: ${err.message}`).catch(console.error);
+          }
+          return;
+        }
+
+        if (command === "stop" || command === "t") {
+          const music = MusicManager.getManager(message.guildId!);
+          music.stop();
+          message.reply("⏹️ Musik dihentikan dan antrean telah dibersihkan.").catch(console.error);
+          return;
+        }
+
+        if (command === "join") {
+          const voiceChannel = message.member?.voice.channel;
+          if (!voiceChannel) {
+            message.reply("Mohon maaf, Anda harus berada di dalam saluran suara untuk memanggil saya.").catch(console.error);
+            return;
+          }
+
+          try {
+            await connectToVoice(voiceChannel.id, voiceChannel.guild.id, voiceChannel.guild.voiceAdapterCreator);
+            message.reply(`Berhasil terhubung ke saluran suara **${voiceChannel.name}**.`).catch(console.error);
+          } catch (err: any) {
+            message.reply(`Gagal menghubungkan: ${err.message}`).catch(console.error);
+          }
+          return;
+        }
+
+        if (command === "leave") {
+          const voiceChannel = message.member?.voice.channel;
+          const connection = getVoiceConnection(message.guildId!);
+          
+          if (!connection) {
+            message.reply("Saat ini saya tidak terhubung ke saluran suara mana pun.").catch(console.error);
+            return;
+          }
+
+          if (!voiceChannel || voiceChannel.id !== connection.joinConfig.channelId) {
+            message.reply("Mohon maaf, Anda harus berada di saluran suara yang sama dengan saya untuk memberikan perintah ini.").catch(console.error);
+            return;
+          }
+
+          stopVoiceConnection(message.guildId!);
+          message.reply("Koneksi saluran suara telah diputuskan. Sampai jumpa kembali.").catch(console.error);
+          return;
+        }
+
+        if (command === "init") {
+          message.reply("Sistem telah diinisialisasi. Saya akan tetap aktif menjaga koneksi.").catch(console.error);
+          return;
+        }
+
+        if (command === "setup") {
+          if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
+            message.reply("Mohon maaf, perintah ini hanya dapat dijalankan oleh Administrator server.").catch(console.error);
+            return;
+          }
+
+          const setupEmbed = new EmbedBuilder()
+            .setColor("#5865F2")
+            .setTitle("AuraBot Configuration Center")
+            .setDescription("Selamat datang di pusat pengaturan AuraBot. Gunakan tombol di bawah ini untuk mengelola fungsionalitas bot di server Anda.")
+            .addFields(
+              { name: "Prefix Saat Ini", value: `\`${guildPrefix}\``, inline: true },
+              { name: "Dashboard URL", value: `[Klik di sini](https://${message.guild!.id}.dashboard.aurabot.com)`, inline: true }
+            )
+            .setFooter({ text: "Sistem Pengaturan Bot • Gunakan dengan bijak" })
+            .setTimestamp();
+
+          const row = new ActionRowBuilder<ButtonBuilder>()
+            .addComponents(
+              new ButtonBuilder()
+                .setCustomId('setup_prefix')
+                .setLabel('Ganti Prefix')
+                .setStyle(ButtonStyle.Primary)
+                .setEmoji('⌨️'),
+              new ButtonBuilder()
+                .setCustomId('setup_roles')
+                .setLabel('Kelola Roles')
+                .setStyle(ButtonStyle.Secondary)
+                .setEmoji('🛡️')
+            );
+
+          const response = await message.reply({ 
+            embeds: [setupEmbed], 
+            components: [row] 
+          });
+
+          const collector = response.createMessageComponentCollector({ 
+            componentType: ComponentType.Button, 
+            time: 60000 
+          });
+
+          collector.on('collect', async i => {
+            if (i.user.id !== message.author.id) {
+              await i.reply({ content: "Mohon maaf, hanya pemanggil perintah yang dapat berinteraksi.", ephemeral: true });
+              return;
+            }
+
+            if (i.customId === 'setup_prefix') {
+              await i.reply({ content: "Untuk mengganti prefix, silakan gunakan dashboard website kami untuk keamanan yang lebih baik.", ephemeral: true });
+            } else if (i.customId === 'setup_roles') {
+              await i.reply({ content: "Pengaturan role dapat dikelola melalui dashboard pada menu 'Manage Server'.", ephemeral: true });
+            }
+          });
+
+          return;
+        }
+
+        if (command === "ping") {
+          const pingEmbed = new EmbedBuilder()
+            .setColor("#5865F2")
+            .setTitle("Status Koneksi")
+            .setDescription(`🏓 Latensi bot saat ini adalah **${client?.ws.ping}ms**.`)
+            .setTimestamp()
+            .setFooter({ text: "Sistem Pemantauan Bot" });
+          
+          message.reply({ embeds: [pingEmbed] }).catch(console.error);
+          return;
+        }
+
+        if (command === "purge") {
+          if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) {
+            message.reply("Mohon maaf, Anda tidak memiliki izin untuk mengelola pesan di saluran ini.").catch(console.error);
+            return;
+          }
+
+          const amount = parseInt(args[0]);
+          if (isNaN(amount) || amount < 1 || amount > 100) {
+            message.reply("Silakan masukkan jumlah pesan yang valid (antara 1 hingga 100).").catch(console.error);
+            return;
+          }
+
+          if (message.channel instanceof TextChannel) {
+            try {
+              await message.channel.bulkDelete(amount + 1, true);
+              const purgeEmbed = new EmbedBuilder()
+                .setColor("#10B981")
+                .setDescription(`✅ Berhasil menghapus **${amount}** pesan.`)
+                .setTimestamp();
+              
+              const sentMessage = await message.channel.send({ embeds: [purgeEmbed] });
+              setTimeout(() => sentMessage.delete().catch(console.error), 5000);
+            } catch (err: any) {
+              message.reply(`Gagal menghapus pesan: ${err.message}`).catch(console.error);
+            }
+          }
+          return;
+        }
+
+        if (command === "help") {
+          const helpEmbed = new EmbedBuilder()
+            .setColor("#5865F2")
+            .setTitle("Panduan Perintah Bot")
+            .setDescription("Berikut adalah daftar perintah yang tersedia dalam sistem ini:")
+            .addFields(
+              { name: `\`${guildPrefix}init\``, value: "Inisialisasi sistem untuk memastikan bot tetap aktif." },
+              { name: `\`${guildPrefix}setup\``, value: "Membuka menu pengaturan bot (Admin Only)." },
+              { name: `\`${guildPrefix}join\``, value: "Memanggil bot ke saluran suara Anda saat ini." },
+              { name: `\`${guildPrefix}leave\``, value: "Memutuskan koneksi bot dari saluran suara." },
+              { name: `\`${guildPrefix}ping\``, value: "Menampilkan latensi koneksi bot." },
+              { name: `\`${guildPrefix}purge [angka]\``, value: "Menghapus sejumlah pesan di saluran teks (Maksimal 100)." },
+              { name: `\`${guildPrefix}help\``, value: "Menampilkan panduan bantuan ini." },
+              { name: "Sistem Musik", value: `\`${guildPrefix}play [judul]\` / \`p\`: Memutar musik dari SoundCloud.\n\`${guildPrefix}search [judul]\` / \`s\`: Mencari musik di SoundCloud.\n\`${guildPrefix}stop\` / \`t\`: Menghentikan musik.` }
+            )
+            .addFields({ 
+              name: "Informasi Tambahan", 
+              value: "Pastikan bot memiliki izin yang cukup di server ini untuk menjalankan semua fungsi dengan optimal." 
+            })
+            .setTimestamp()
+            .setFooter({ text: "Sistem Bantuan Bot" });
+
+          message.reply({ embeds: [helpEmbed] }).catch(console.error);
+          return;
+        }
+      }
+
+      // Handle Mentions - ONLY direct mentions to this bot (not @everyone or @here)
+      if (message.mentions.users.has(BOT_ID)) {
+        const randomMessage = responses[Math.floor(Math.random() * responses.length)];
+        message.reply(randomMessage).catch(console.error);
+      }
+    });
+
     client!.once("ready", async (c) => {
       try {
-        const settings = await storage.getSettings();
-        if (settings) {
-          updatePresence(settings);
-        }
+        console.log(`Bot logged in as ${c.user.tag}`);
+        
+        // Use hardcoded settings for global presence
+        updatePresence(HARDCODED_SETTINGS);
 
-        const channel = await c.channels.fetch(channelId);
-        if (!channel || !channel.isVoiceBased()) {
-          throw new Error("Invalid voice channel ID");
+        // If channelId was provided (e.g. from a manual start with old config)
+        if (channelId) {
+          const channel = await c.channels.fetch(channelId);
+          if (channel && channel.isVoiceBased()) {
+            await connectToVoice(channel.id, channel.guild.id, channel.guild.voiceAdapterCreator);
+          }
         }
-
-        joinVoiceChannel({
-          channelId: channel.id,
-          guildId: channel.guild.id,
-          adapterCreator: channel.guild.voiceAdapterCreator,
-        });
 
         currentStatus = "connected";
         resolve();
       } catch (err: any) {
+        console.error("Failed during bot ready:", err);
         currentStatus = "error";
         errorMessage = err.message;
         reject(err);
@@ -70,12 +384,66 @@ export async function startBot(token: string, channelId: string) {
       errorMessage = err.message;
     });
 
-    client!.login(token).catch((err) => {
+    client!.login(BOT_TOKEN).catch((err) => {
       currentStatus = "error";
       errorMessage = "Invalid token or failed to login: " + err.message;
       reject(err);
     });
   });
+}
+
+async function connectToVoice(channelId: string, guildId: string, adapterCreator: any, retryCount = 0) {
+  const MAX_RETRIES = 5;
+  const RETRY_DELAY = 5000; // 5 seconds
+
+  try {
+    console.log(`Attempting to join voice channel: ${channelId} (Attempt ${retryCount + 1})`);
+
+    const connection = joinVoiceChannel({
+      channelId,
+      guildId,
+      adapterCreator,
+      selfDeaf: true,
+      selfMute: false,
+    });
+
+    connection.on("stateChange", (oldState, newState) => {
+      console.log(`Voice connection state changed from ${oldState.status} to ${newState.status}`);
+      if (newState.status === VoiceConnectionStatus.Disconnected) {
+        // Handle unexpected disconnect
+        if (retryCount < MAX_RETRIES) {
+          console.log(`Unexpectedly disconnected. Retrying in ${RETRY_DELAY / 1000}s...`);
+          setTimeout(() => connectToVoice(channelId, guildId, adapterCreator, retryCount + 1), RETRY_DELAY);
+        }
+      }
+    });
+
+    connection.on("error", (error) => {
+      console.error("Voice connection error:", error);
+    });
+
+    await entersState(connection, VoiceConnectionStatus.Ready, 15000);
+    console.log(`Successfully connected to voice channel: ${channelId}`);
+  } catch (err: any) {
+    console.error(`Failed to connect to voice channel: ${err.message}`);
+    
+    if (retryCount < MAX_RETRIES) {
+      console.log(`Retrying connection in ${RETRY_DELAY / 1000}s... (${retryCount + 1}/${MAX_RETRIES})`);
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+      return connectToVoice(channelId, guildId, adapterCreator, retryCount + 1);
+    } else {
+      currentStatus = "error";
+      errorMessage = `Gagal menghubungkan ke saluran suara setelah ${MAX_RETRIES} percobaan: ${err.message}`;
+      throw err;
+    }
+  }
+}
+
+function stopVoiceConnection(guildId: string) {
+  const connection = getVoiceConnection(guildId);
+  if (connection) {
+    connection.destroy();
+  }
 }
 
 export function updatePresence(settings: { presenceType: string, presenceName: string, status: string }) {
@@ -101,15 +469,16 @@ export function updatePresence(settings: { presenceType: string, presenceName: s
   });
 }
 
-export function stopBot() {
-  if (client) {
-    client.destroy();
-    client = null;
-  }
-  currentStatus = "disconnected";
-  errorMessage = undefined;
+export function getBotGuilds() {
+  if (!client) return [];
+  return client.guilds.cache.map(guild => ({
+    id: guild.id,
+    name: guild.name,
+    icon: guild.icon,
+  }));
 }
 
+export function stopBot() {
   if (client) {
     client.destroy();
     client = null;

@@ -3,13 +3,104 @@ import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { api, errorSchemas } from "@shared/routes";
 import { z } from "zod";
-import { startBot, stopBot, getBotStatus, initializeBotIfActive, updatePresence } from "./discord";
+import { startBot, stopBot, getBotStatus, initializeBotIfActive, updatePresence, getBotGuilds } from "./discord";
 
 export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
   
+  app.get("/api/guilds", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Not authenticated" });
+    }
+
+    try {
+      const response = await fetch("https://discord.com/api/users/@me/guilds", {
+        headers: {
+          Authorization: `Bearer ${req.user.accessToken}`,
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to fetch guilds from Discord");
+      }
+
+      const userGuilds = await response.json() as any[];
+      const botGuilds = getBotGuilds();
+
+      const guilds = userGuilds
+        .filter((guild: any) => (BigInt(guild.permissions) & BigInt(0x20)) === BigInt(0x20)) // MANAGE_GUILD permission
+        .map((guild: any) => ({
+          ...guild,
+          botJoined: botGuilds.some(bg => bg.id === guild.id),
+        }));
+
+      res.json(guilds);
+    } catch (err) {
+      console.error("Error fetching guilds:", err);
+      res.status(500).json({ message: "Failed to fetch guilds" });
+    }
+  });
+
+  app.get("/api/guilds/:guildId/roles", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Not authenticated" });
+    }
+
+    const { guildId } = req.params;
+    
+    try {
+      // Check if bot is in guild
+      const botGuilds = getBotGuilds();
+      if (!botGuilds.some(bg => bg.id === guildId)) {
+        return res.status(404).json({ message: "Bot not in this guild" });
+      }
+
+      const response = await fetch(`https://discord.com/api/guilds/${guildId}/roles`, {
+        headers: {
+          Authorization: `Bot ${process.env.DISCORD_TOKEN}`,
+        },
+      });
+
+      if (!response.ok) {
+        const errorData = await response.text();
+        console.error(`Discord API Error (${response.status}):`, errorData);
+        throw new Error(`Failed to fetch roles: ${response.statusText}`);
+      }
+
+      const roles = await response.json();
+      res.json(roles);
+    } catch (err) {
+      console.error("Error fetching roles:", err);
+      res.status(500).json({ message: "Failed to fetch roles" });
+    }
+  });
+
+  app.get("/api/guilds/:guildId/settings", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Not authenticated" });
+    }
+
+    const { guildId } = req.params;
+    const settings = await storage.getGuildSettings(guildId);
+    res.json(settings || { guildId, allowedRoles: [], blockedRoles: [] });
+  });
+
+  app.post("/api/guilds/:guildId/settings", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Not authenticated" });
+    }
+
+    const { guildId } = req.params;
+    try {
+      const updated = await storage.updateGuildSettings(guildId, req.body);
+      res.json(updated);
+    } catch (err) {
+      res.status(500).json({ message: "Failed to save settings" });
+    }
+  });
+
   app.get(api.settings.get.path, async (req, res) => {
     const settings = await storage.getSettings();
     res.json(settings || null);
@@ -19,9 +110,6 @@ export async function registerRoutes(
     try {
       const input = api.settings.save.input.parse(req.body);
       const updated = await storage.saveSettings(input);
-      
-      // Update bot presence live if it's connected
-      updatePresence(updated);
       
       res.json(updated);
     } catch (err) {
@@ -41,12 +129,12 @@ export async function registerRoutes(
 
   app.post(api.bot.start.path, async (req, res) => {
     const settings = await storage.getSettings();
-    if (!settings || !settings.botToken || !settings.voiceChannelId) {
-      return res.status(400).json({ message: "Bot token and voice channel ID must be configured first." });
+    if (!settings) {
+      return res.status(400).json({ message: "Settings not found." });
     }
     
     try {
-      await startBot(settings.botToken, settings.voiceChannelId);
+      await startBot();
       await storage.saveSettings({ ...settings, isActive: true });
       res.json({ success: true });
     } catch (error: any) {
