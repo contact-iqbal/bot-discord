@@ -135,10 +135,24 @@ export async function startBot(channelId?: string) {
             const music = MusicManager.getManager(message.guildId!);
             music.setChannel(message.channel);
 
-            const [searchResults] = await Promise.all([
-              MusicManager.search(query),
-              connectPromise,
-            ]);
+            // If query is a SoundCloud URL, skip search and stream directly
+            const isScUrl = /^https?:\/\/(soundcloud\.com|snd\.sc)\//i.test(query);
+            let searchResults: Array<{ title: string; url: string; thumbnail: string; duration: string; author: string }>;
+            if (isScUrl) {
+              searchResults = [{
+                title: query,
+                url: query,
+                thumbnail: "",
+                duration: "0:00",
+                author: "Unknown",
+              }];
+              await connectPromise;
+            } else {
+              [searchResults] = await Promise.all([
+                MusicManager.search(query),
+                connectPromise,
+              ]);
+            }
 
             if (searchResults.length === 0) {
               message.reply("Maaf, tidak dapat menemukan lagu tersebut di SoundCloud.").catch(console.error);

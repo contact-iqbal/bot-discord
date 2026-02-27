@@ -12,8 +12,23 @@ import { EmbedBuilder, TextBasedChannel } from "discord.js";
 // Global state for SoundCloud initialization
 let isSoundCloudInitialized = false;
 let isInitializing = false;
+const ENV_CLIENT_ID = process.env.SOUNDCLOUD_CLIENT_ID;
+let usedEnvClientId = !!ENV_CLIENT_ID;
 
-async function ensureSoundCloudAuth(force = false) {
+async function setSoundCloudToken(useEnvPreferred: boolean) {
+  if (useEnvPreferred && ENV_CLIENT_ID) {
+    await play.setToken({ soundcloud: { client_id: ENV_CLIENT_ID } });
+    usedEnvClientId = true;
+    return true;
+  }
+  const freeId = await play.getFreeClientID();
+  if (!freeId) return false;
+  await play.setToken({ soundcloud: { client_id: freeId } });
+  usedEnvClientId = false;
+  return true;
+}
+
+async function ensureSoundCloudAuth(force = false, preferEnvFirst = true) {
   if (isSoundCloudInitialized && !force) return true;
   if (isInitializing) {
     while (isInitializing) {
@@ -23,12 +38,10 @@ async function ensureSoundCloudAuth(force = false) {
   }
   isInitializing = true;
   try {
-    const envId = process.env.SOUNDCLOUD_CLIENT_ID;
-    const clientId = envId && envId.length > 0 ? envId : await play.getFreeClientID();
-    if (!clientId) throw new Error("Failed to obtain SoundCloud client_id");
-    await play.setToken({ soundcloud: { client_id: clientId } });
+    const ok = await setSoundCloudToken(preferEnvFirst);
+    if (!ok) throw new Error("Failed to obtain SoundCloud client_id");
     isSoundCloudInitialized = true;
-  } catch (_err) {
+  } catch (_err: any) {
     isSoundCloudInitialized = false;
   } finally {
     isInitializing = false;
@@ -119,9 +132,10 @@ class GuildMusicManager {
         quality: 1,
         discordPlayerCompatibility: true,
       }).catch(async (err) => {
-        if (err.message.includes("404") || err.message.includes("client_id")) {
+        const msg = String(err.message || "");
+        if (msg.includes("404") || msg.includes("403") || msg.includes("client_id")) {
           isSoundCloudInitialized = false;
-          await ensureSoundCloudAuth(true);
+          await ensureSoundCloudAuth(true, !usedEnvClientId);
           return await play.stream(track.url, {
             quality: 1,
             discordPlayerCompatibility: true,
@@ -154,9 +168,10 @@ class GuildMusicManager {
       this.channel?.send(`❌ Gagal memutar lagu: ${err.message}`).catch(console.error);
       
       // Auto-healing: Try to re-init if client_id error occurs
-      if (err.message.includes("client_id") || err.message.includes("404")) {
+      const msg = String(err.message || "");
+      if (msg.includes("client_id") || msg.includes("404") || msg.includes("403")) {
         isSoundCloudInitialized = false;
-        await ensureSoundCloudAuth(true);
+        await ensureSoundCloudAuth(true, !usedEnvClientId);
       }
       
       this.playNext();
@@ -191,7 +206,13 @@ export class MusicManager {
         return [];
       }
 
-      const results = await play.search(query, { source: { soundcloud: "tracks" }, limit: 1 });
+      const results = await play.search(query, { source: { soundcloud: "tracks" }, limit: 1 }).catch(async (err: any) => {
+        if (String(err.message || "").includes("403") || String(err.message || "").includes("client_id")) {
+          await ensureSoundCloudAuth(true, !usedEnvClientId);
+          return await play.search(query, { source: { soundcloud: "tracks" }, limit: 1 });
+        }
+        throw err;
+      });
       
       return results.map(v => ({
         title: v.name || "Unknown",
