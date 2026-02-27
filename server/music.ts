@@ -13,38 +13,22 @@ import { EmbedBuilder, TextBasedChannel } from "discord.js";
 let isSoundCloudInitialized = false;
 let isInitializing = false;
 
-/**
- * Robust Initialization: Ensures SoundCloud Client ID is fetched and set.
- * Uses a locking mechanism (isInitializing) to prevent race conditions.
- */
-async function ensureSoundCloudAuth() {
-  if (isSoundCloudInitialized) return true;
+async function ensureSoundCloudAuth(force = false) {
+  if (isSoundCloudInitialized && !force) return true;
   if (isInitializing) {
-    // Wait for the ongoing initialization to finish
     while (isInitializing) {
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     return isSoundCloudInitialized;
   }
-
   isInitializing = true;
   try {
-    console.log("[SoundCloud] Fetching free client ID...");
-    const clientId = await play.getFreeClientID();
-    
-    if (clientId) {
-      await play.setToken({
-        soundcloud: {
-          client_id: clientId
-        }
-      });
-      isSoundCloudInitialized = true;
-      console.log("[SoundCloud] Client ID set successfully:", clientId);
-    } else {
-      throw new Error("Failed to obtain a free Client ID from SoundCloud.");
-    }
-  } catch (err: any) {
-    console.error("[SoundCloud] Initialization failed:", err.message);
+    const envId = process.env.SOUNDCLOUD_CLIENT_ID;
+    const clientId = envId && envId.length > 0 ? envId : await play.getFreeClientID();
+    if (!clientId) throw new Error("Failed to obtain SoundCloud client_id");
+    await play.setToken({ soundcloud: { client_id: clientId } });
+    isSoundCloudInitialized = true;
+  } catch (_err) {
     isSoundCloudInitialized = false;
   } finally {
     isInitializing = false;
@@ -135,11 +119,9 @@ class GuildMusicManager {
         quality: 1,
         discordPlayerCompatibility: true,
       }).catch(async (err) => {
-        // If 404 occurs, try to re-initialize SoundCloud and retry once
         if (err.message.includes("404") || err.message.includes("client_id")) {
-          console.warn("[SoundCloud] Got 404/Auth error, re-initializing...");
           isSoundCloudInitialized = false;
-          await ensureSoundCloudAuth();
+          await ensureSoundCloudAuth(true);
           return await play.stream(track.url, {
             quality: 1,
             discordPlayerCompatibility: true,
@@ -172,9 +154,9 @@ class GuildMusicManager {
       this.channel?.send(`❌ Gagal memutar lagu: ${err.message}`).catch(console.error);
       
       // Auto-healing: Try to re-init if client_id error occurs
-      if (err.message.includes("client_id")) {
+      if (err.message.includes("client_id") || err.message.includes("404")) {
         isSoundCloudInitialized = false;
-        await ensureSoundCloudAuth();
+        await ensureSoundCloudAuth(true);
       }
       
       this.playNext();
