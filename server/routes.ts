@@ -9,6 +9,15 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+
+  // Health check endpoint for Uptime monitoring (e.g. UptimeRobot)
+  app.get("/api/health", (_req, res) => {
+    res.json({ 
+      status: "ok", 
+      uptime: process.uptime(),
+      bot: getBotStatus()
+    });
+  });
   
   app.get("/api/guilds", async (req, res) => {
     if (!req.isAuthenticated()) {
