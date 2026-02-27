@@ -6,51 +6,84 @@ import {
   getVoiceConnection, 
   VoiceConnection 
 } from "@discordjs/voice";
-import play from "play-dl";
-import { EmbedBuilder, TextBasedChannel } from "discord.js";
+import { EmbedBuilder, TextBasedChannel, TextChannel, DMChannel, NewsChannel } from "discord.js";
+import { spawn } from "child_process";
+import { Readable } from "stream";
 
-// Global state for SoundCloud initialization
-let isSoundCloudInitialized = false;
-let isInitializing = false;
-const ENV_CLIENT_ID = process.env.SOUNDCLOUD_CLIENT_ID;
-let usedEnvClientId = !!ENV_CLIENT_ID;
-
-async function setSoundCloudToken(useEnvPreferred: boolean) {
-  if (useEnvPreferred && ENV_CLIENT_ID) {
-    await play.setToken({ soundcloud: { client_id: ENV_CLIENT_ID } });
-    usedEnvClientId = true;
-    return true;
-  }
-  const freeId = await play.getFreeClientID();
-  if (!freeId) return false;
-  await play.setToken({ soundcloud: { client_id: freeId } });
-  usedEnvClientId = false;
-  return true;
-}
-
-async function ensureSoundCloudAuth(force = false, preferEnvFirst = true) {
-  if (isSoundCloudInitialized && !force) return true;
-  if (isInitializing) {
-    while (isInitializing) {
-      await new Promise(resolve => setTimeout(resolve, 100));
+// Helper function to stream audio using yt-dlp directly
+// This is more robust than play-dl for cloud environments
+function getYtdlpStream(url: string): Readable {
+  console.log(`[yt-dlp] Spawning process for: ${url}`);
+  const process = spawn('yt-dlp', [
+    '-f', 'bestaudio',
+    '--no-playlist',
+    '--no-check-certificate',
+    '--geo-bypass',
+    '-o', '-',
+    '-q', // quiet mode
+    url
+  ]);
+  
+  process.stderr.on('data', (data) => {
+    // Only log actual errors, ignore progress info
+    const msg = data.toString();
+    if (msg.includes('ERROR')) {
+        console.error(`[yt-dlp error] ${msg}`);
     }
-    return isSoundCloudInitialized;
-  }
-  isInitializing = true;
-  try {
-    const ok = await setSoundCloudToken(preferEnvFirst);
-    if (!ok) throw new Error("Failed to obtain SoundCloud client_id");
-    isSoundCloudInitialized = true;
-  } catch (_err: any) {
-    isSoundCloudInitialized = false;
-  } finally {
-    isInitializing = false;
-  }
-  return isSoundCloudInitialized;
+  });
+
+  return process.stdout;
 }
 
-// Initial attempt at startup (non-blocking)
-ensureSoundCloudAuth().catch(console.error);
+// Helper function to search using yt-dlp
+async function searchYtdlp(query: string): Promise<Track[]> {
+    return new Promise((resolve) => {
+        console.log(`[yt-dlp] Searching for: ${query}`);
+        const process = spawn('yt-dlp', [
+            `ytsearch1:${query}`,
+            '--dump-json',
+            '--no-playlist',
+            '--no-check-certificate',
+            '--geo-bypass',
+            '--quiet'
+        ]);
+        
+        let data = '';
+        process.stdout.on('data', (chunk) => data += chunk);
+        
+        process.on('close', (code) => {
+            if (code !== 0 || !data.trim()) {
+                console.warn(`[yt-dlp] Search failed or found nothing for: ${query}`);
+                return resolve([]); 
+            }
+            try {
+                // yt-dlp might output multiple JSON lines if not careful, but ytsearch1 should be one
+                const lines = data.trim().split('\n');
+                const info = JSON.parse(lines[0]);
+                
+                // Format duration
+                let duration = "0:00";
+                if (info.duration) {
+                    const minutes = Math.floor(info.duration / 60);
+                    const seconds = Math.floor(info.duration % 60);
+                    duration = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+                }
+
+                resolve([{
+                    title: info.title || "Unknown",
+                    url: info.webpage_url || info.url,
+                    thumbnail: info.thumbnail || "",
+                    duration: duration,
+                    author: info.uploader || info.channel || "Unknown",
+                    requestedBy: "" 
+                }]);
+            } catch (e) {
+                console.error("[yt-dlp] Failed to parse search result:", e);
+                resolve([]);
+            }
+        });
+    });
+}
 
 interface Track {
   title: string;
@@ -61,11 +94,13 @@ interface Track {
   requestedBy: string;
 }
 
+type MusicTextChannel = TextChannel | DMChannel | NewsChannel;
+
 class GuildMusicManager {
   public readonly player: AudioPlayer;
   public queue: Track[] = [];
   public currentTrack: Track | null = null;
-  private channel: TextBasedChannel | null = null;
+  private channel: MusicTextChannel | null = null;
 
   constructor() {
     this.player = createAudioPlayer();
@@ -81,7 +116,9 @@ class GuildMusicManager {
   }
 
   public setChannel(channel: TextBasedChannel) {
-    this.channel = channel;
+    if ('send' in channel) {
+        this.channel = channel as MusicTextChannel;
+    }
   }
 
   public async addToQueue(track: Track, guildId: string) {
@@ -122,56 +159,12 @@ class GuildMusicManager {
     try {
       console.log("[Music] Attempting to stream URL:", track.url);
       
-      let stream;
-      try {
-        const isAuthReady = await ensureSoundCloudAuth();
-        if (!isAuthReady) {
-          throw new Error("SoundCloud authentication is not ready.");
-        }
-
-        // play-dl sometimes fails with 404 if the URL isn't properly resolved or if client_id is stale
-        stream = await play.stream(track.url, {
-          quality: 1,
-          discordPlayerCompatibility: true,
-        });
-      } catch (err: any) {
-        const msg = String(err.message || "");
-        console.warn(`[Music] Primary stream failed (${msg}). Attempting recovery...`);
-
-        // First recovery attempt: Refresh SoundCloud token if it looks like an auth/network issue
-        if (msg.includes("404") || msg.includes("403") || msg.includes("client_id") || msg.includes("Status code") || msg.includes("authentication is not ready")) {
-          isSoundCloudInitialized = false;
-          await ensureSoundCloudAuth(true, !usedEnvClientId);
-          
-          try {
-            stream = await play.stream(track.url, {
-              quality: 1,
-              discordPlayerCompatibility: true,
-            });
-          } catch (retryErr: any) {
-             console.warn(`[Music] Retry failed: ${retryErr.message}. Switching to YouTube fallback.`);
-             // Fallback to YouTube
-             const searchQuery = `${track.title} ${track.author}`;
-             const ytResults = await play.search(searchQuery, { source: { youtube: "video" }, limit: 1 });
-             
-             if (ytResults.length > 0) {
-               stream = await play.stream(ytResults[0].url, {
-                 quality: 1,
-                 discordPlayerCompatibility: true,
-               });
-               console.log(`[Music] Fallback successful. Playing from YouTube: ${ytResults[0].url}`);
-             } else {
-               throw retryErr; // Throw original error if no fallback found
-             }
-          }
-        } else {
-          throw err;
-        }
-      }
-
-      const resource = createAudioResource(stream.stream, {
-        inputType: stream.type,
-        inlineVolume: false, // Disabling inline volume saves CPU on Replit
+      // Use yt-dlp stream directly
+      const stream = getYtdlpStream(track.url);
+      
+      // Use generic resource creation - ffmpeg will probe the input
+      const resource = createAudioResource(stream, {
+        inlineVolume: false,
       });
 
       this.player.play(resource);
@@ -191,14 +184,6 @@ class GuildMusicManager {
     } catch (err: any) {
       console.error("[Music] Playback Error:", err.message);
       this.channel?.send(`❌ Gagal memutar lagu: ${err.message}`).catch(console.error);
-      
-      // Auto-healing: Try to re-init if client_id error occurs
-      const msg = String(err.message || "");
-      if (msg.includes("client_id") || msg.includes("404") || msg.includes("403")) {
-        isSoundCloudInitialized = false;
-        await ensureSoundCloudAuth(true, !usedEnvClientId);
-      }
-      
       this.playNext();
     }
   }
@@ -224,75 +209,12 @@ export class MusicManager {
 
   public static async search(query: string) {
     try {
-      // Robust Initialization: Ensure token is ready before searching
-      const isAuthReady = await ensureSoundCloudAuth();
-      if (!isAuthReady) {
-        console.error("[Music] Search failed: Authentication not ready.");
-      }
-
-      let results;
-      try {
-        results = await play.search(query, { source: { soundcloud: "tracks" }, limit: 1 });
-      } catch (err: any) {
-        const msg = String(err.message || "");
-        if (msg.includes("403") || msg.includes("client_id") || msg.includes("Status code")) {
-          console.warn("[Music] SoundCloud search failed. Refreshing token...");
-          isSoundCloudInitialized = false;
-          await ensureSoundCloudAuth(true, !usedEnvClientId);
-          try {
-             results = await play.search(query, { source: { soundcloud: "tracks" }, limit: 1 });
-          } catch (retryErr: any) {
-             console.warn("[Music] SoundCloud retry failed. Switching to YouTube fallback.");
-             results = await play.search(query, { source: { youtube: "video" }, limit: 1 });
-          }
-        } else {
-          throw err;
-        }
-      }
-      
-      if (!results) return [];
-
-      return results.map((v: any) => {
-        // YouTube Video
-        if (v.type === "video") {
-           return {
-             title: v.title || "Unknown",
-             url: v.url,
-             thumbnail: v.thumbnails?.[0]?.url || "",
-             duration: v.durationRaw || "0:00",
-             author: v.channel?.name || "Unknown",
-           };
-        }
-        // SoundCloud Track
-        return {
-          title: v.name || "Unknown",
-          url: v.url,
-          thumbnail: v.thumbnail || "",
-          duration: v.durationInMs ? `${Math.floor(v.durationInMs / 60000)}:${String(Math.floor((v.durationInMs % 60000) / 1000)).padStart(2, '0')}` : "0:00",
-          author: v.user?.username || "Unknown",
-        };
-      });
+       // Use yt-dlp for search
+       const results = await searchYtdlp(query);
+       return results;
     } catch (err: any) {
       console.error("[Music] Search Error:", err.message);
-      
-      // Self-Healing: If client_id error, reset flag to force re-init on next call
-      if (err.message.includes("client_id")) {
-        isSoundCloudInitialized = false;
-      }
-      
-      // Final Fallback: Try YouTube if everything else failed
-      try {
-         const ytResults = await play.search(query, { source: { youtube: "video" }, limit: 1 });
-         return ytResults.map((v: any) => ({
-             title: v.title || "Unknown",
-             url: v.url,
-             thumbnail: v.thumbnails?.[0]?.url || "",
-             duration: v.durationRaw || "0:00",
-             author: v.channel?.name || "Unknown",
-         }));
-      } catch (ytErr) {
-         return [];
-      }
+      return []; 
     }
   }
 }

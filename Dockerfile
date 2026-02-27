@@ -27,10 +27,17 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Install runtime dependencies (ffmpeg is used by @discordjs/voice/play-dl)
+# Install runtime dependencies (ffmpeg and python3/yt-dlp)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    python3 \
+    python3-pip \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Install yt-dlp binary directly
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
+    chmod a+rx /usr/local/bin/yt-dlp
 
 # Copy built assets from builder stage
 COPY --from=builder /app/dist ./dist
