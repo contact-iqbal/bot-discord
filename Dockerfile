@@ -39,12 +39,12 @@ COPY --from=builder /app/package*.json ./
 # Install only production dependencies
 RUN npm install --omit=dev
 
-# Expose the port the app runs on
-EXPOSE 5000
+# Expose the port the app runs on (Cloud Run uses 8080 by default)
+EXPOSE 8080
 
 # Set environment variables
 ENV NODE_ENV=production
-ENV PORT=5000
+ENV PORT=8080
 
 # Start the application
 CMD ["npm", "start"]
