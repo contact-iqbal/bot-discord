@@ -209,7 +209,7 @@ export class MusicManager {
         return [];
       }
 
-      const results = await play.search(query, { source: { soundcloud: "tracks" }, limit: 5 });
+      const results = await play.search(query, { source: { soundcloud: "tracks" }, limit: 1 });
       
       return results.map(v => ({
         title: v.name || "Unknown",

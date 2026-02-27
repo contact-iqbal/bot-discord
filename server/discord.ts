@@ -125,16 +125,20 @@ export async function startBot(channelId?: string) {
           }
 
           try {
-            // Ensure bot is connected
+            await message.channel.send("🔎 Memproses permintaan Anda...").catch(() => {});
+
             const connection = getVoiceConnection(message.guildId!);
-            if (!connection) {
-              await connectToVoice(voiceChannel.id, voiceChannel.guild.id, voiceChannel.guild.voiceAdapterCreator);
-            }
+            const connectPromise = connection
+              ? Promise.resolve()
+              : connectToVoice(voiceChannel.id, voiceChannel.guild.id, voiceChannel.guild.voiceAdapterCreator);
 
             const music = MusicManager.getManager(message.guildId!);
             music.setChannel(message.channel);
 
-            const searchResults = await MusicManager.search(query);
+            const [searchResults] = await Promise.all([
+              MusicManager.search(query),
+              connectPromise,
+            ]);
 
             if (searchResults.length === 0) {
               message.reply("Maaf, tidak dapat menemukan lagu tersebut di SoundCloud.").catch(console.error);
