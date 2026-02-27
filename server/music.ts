@@ -123,15 +123,29 @@ class GuildMusicManager {
     this.currentTrack = track;
 
     try {
-      // Ensure auth is ready before streaming
+      console.log("[SoundCloud] Attempting to stream URL:", track.url);
+      
       const isAuthReady = await ensureSoundCloudAuth();
       if (!isAuthReady) {
         throw new Error("SoundCloud authentication is not ready.");
       }
 
+      // play-dl sometimes fails with 404 if the URL isn't properly resolved or if client_id is stale
       const stream = await play.stream(track.url, {
-        quality: 1, // Higher quality
+        quality: 1,
         discordPlayerCompatibility: true,
+      }).catch(async (err) => {
+        // If 404 occurs, try to re-initialize SoundCloud and retry once
+        if (err.message.includes("404") || err.message.includes("client_id")) {
+          console.warn("[SoundCloud] Got 404/Auth error, re-initializing...");
+          isSoundCloudInitialized = false;
+          await ensureSoundCloudAuth();
+          return await play.stream(track.url, {
+            quality: 1,
+            discordPlayerCompatibility: true,
+          });
+        }
+        throw err;
       });
 
       const resource = createAudioResource(stream.stream, {
