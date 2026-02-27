@@ -27,24 +27,24 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Install runtime dependencies (ffmpeg and python3/yt-dlp)
+# Install runtime dependencies (Java 17 for Lavalink)
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    python3 \
-    python3-pip \
+    openjdk-17-jre-headless \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp binary directly
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
-    chmod a+rx /usr/local/bin/yt-dlp
+# Install Lavalink
+RUN curl -L https://github.com/lavalink-devs/Lavalink/releases/download/4.0.8/Lavalink.jar -o Lavalink.jar
 
 # Copy built assets from builder stage
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/package*.json ./
+COPY application.yml ./
+COPY start.sh ./
 
 # Install only production dependencies
 RUN npm install --omit=dev
+RUN chmod +x start.sh
 
 # Expose the port the app runs on (Cloud Run uses 8080 by default)
 EXPOSE 8080
@@ -53,5 +53,5 @@ EXPOSE 8080
 ENV NODE_ENV=production
 ENV PORT=8080
 
-# Start the application
-CMD ["npm", "start"]
+# Start the application using start.sh wrapper
+CMD ["./start.sh"]

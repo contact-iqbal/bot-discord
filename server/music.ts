@@ -1,220 +1,222 @@
-import { 
-  AudioPlayer, 
-  AudioPlayerStatus, 
-  createAudioPlayer, 
-  createAudioResource, 
-  getVoiceConnection, 
-  VoiceConnection 
-} from "@discordjs/voice";
-import { EmbedBuilder, TextBasedChannel, TextChannel, DMChannel, NewsChannel } from "discord.js";
-import { spawn } from "child_process";
-import { Readable } from "stream";
+import { Client, TextBasedChannel, TextChannel, DMChannel, NewsChannel, EmbedBuilder } from "discord.js";
+import { Shoukaku, Connectors, NodeOption, Player, Track, TrackExceptionEvent } from "shoukaku";
 
-// Helper function to stream audio using yt-dlp directly
-// This is more robust than play-dl for cloud environments
-function getYtdlpStream(url: string): Readable {
-  console.log(`[yt-dlp] Spawning process for: ${url}`);
-  const process = spawn('yt-dlp', [
-    '-f', 'bestaudio',
-    '--no-playlist',
-    '--no-check-certificate',
-    '--geo-bypass',
-    '-o', '-',
-    '-q', // quiet mode
-    url
-  ]);
-  
-  process.stderr.on('data', (data) => {
-    // Only log actual errors, ignore progress info
-    const msg = data.toString();
-    if (msg.includes('ERROR')) {
-        console.error(`[yt-dlp error] ${msg}`);
-    }
-  });
+const Nodes: NodeOption[] = [{
+    name: 'LocalNode',
+    url: 'localhost:2333',
+    auth: 'youshallnotpass'
+}];
 
-  return process.stdout;
-}
+let shoukaku: Shoukaku | null = null;
 
-// Helper function to search using yt-dlp
-async function searchYtdlp(query: string): Promise<Track[]> {
-    return new Promise((resolve) => {
-        console.log(`[yt-dlp] Searching for: ${query}`);
-        const process = spawn('yt-dlp', [
-            `ytsearch1:${query}`,
-            '--dump-json',
-            '--no-playlist',
-            '--no-check-certificate',
-            '--geo-bypass',
-            '--quiet'
-        ]);
-        
-        let data = '';
-        process.stdout.on('data', (chunk) => data += chunk);
-        
-        process.on('close', (code) => {
-            if (code !== 0 || !data.trim()) {
-                console.warn(`[yt-dlp] Search failed or found nothing for: ${query}`);
-                return resolve([]); 
-            }
-            try {
-                // yt-dlp might output multiple JSON lines if not careful, but ytsearch1 should be one
-                const lines = data.trim().split('\n');
-                const info = JSON.parse(lines[0]);
-                
-                // Format duration
-                let duration = "0:00";
-                if (info.duration) {
-                    const minutes = Math.floor(info.duration / 60);
-                    const seconds = Math.floor(info.duration % 60);
-                    duration = `${minutes}:${seconds.toString().padStart(2, '0')}`;
-                }
-
-                resolve([{
-                    title: info.title || "Unknown",
-                    url: info.webpage_url || info.url,
-                    thumbnail: info.thumbnail || "",
-                    duration: duration,
-                    author: info.uploader || info.channel || "Unknown",
-                    requestedBy: "" 
-                }]);
-            } catch (e) {
-                console.error("[yt-dlp] Failed to parse search result:", e);
-                resolve([]);
-            }
-        });
+export function initializeMusicManager(client: Client) {
+    shoukaku = new Shoukaku(new Connectors.DiscordJS(client), Nodes);
+    
+    shoukaku.on('error', (_, error) => console.error('[Lavalink] Error:', error));
+    shoukaku.on('ready', (name) => console.log(`[Lavalink] Node ${name} is ready`));
+    shoukaku.on('close', (name, code, reason) => console.warn(`[Lavalink] Node ${name} closed: ${code} ${reason}`));
+    shoukaku.on('disconnect', (name, players, moved) => {
+        if (moved) return;
+        players.map(player => player.connection.disconnect());
+        console.warn(`[Lavalink] Node ${name} disconnected`);
     });
 }
 
-interface Track {
-  title: string;
-  url: string;
-  thumbnail: string;
-  duration: string;
-  author: string;
-  requestedBy: string;
+export interface QueueTrack {
+    track: string; // Base64 track string
+    info: {
+        title: string;
+        uri: string;
+        thumbnail?: string;
+        length: number;
+        author: string;
+    };
+    requestedBy: string;
 }
 
 type MusicTextChannel = TextChannel | DMChannel | NewsChannel;
 
 class GuildMusicManager {
-  public readonly player: AudioPlayer;
-  public queue: Track[] = [];
-  public currentTrack: Track | null = null;
-  private channel: MusicTextChannel | null = null;
+    public queue: QueueTrack[] = [];
+    public currentTrack: QueueTrack | null = null;
+    public player: Player | null = null;
+    private channel: MusicTextChannel | null = null;
+    private guildId: string;
 
-  constructor() {
-    this.player = createAudioPlayer();
-
-    this.player.on(AudioPlayerStatus.Idle, () => {
-      this.playNext();
-    });
-
-    this.player.on("error", (error) => {
-      console.error("Audio Player Error:", error.message);
-      this.playNext();
-    });
-  }
-
-  public setChannel(channel: TextBasedChannel) {
-    if ('send' in channel) {
-        this.channel = channel as MusicTextChannel;
-    }
-  }
-
-  public async addToQueue(track: Track, guildId: string) {
-    this.queue.push(track);
-    
-    const connection = getVoiceConnection(guildId);
-    if (connection) {
-      connection.subscribe(this.player);
+    constructor(guildId: string) {
+        this.guildId = guildId;
     }
 
-    if (this.player.state.status === AudioPlayerStatus.Idle) {
-      await this.playNext();
-    } else {
-      const embed = new EmbedBuilder()
-        .setColor("#5865F2")
-        .setTitle("✅ Menambahkan ke Antrean")
-        .setDescription(`**[${track.title}](${track.url})** telah ditambahkan ke antrean.`)
-        .setThumbnail(track.thumbnail)
-        .addFields(
-          { name: "Durasi", value: track.duration, inline: true },
-          { name: "Posisi", value: `#${this.queue.length}`, inline: true }
-        )
-        .setFooter({ text: `Diminta oleh ${track.requestedBy}` });
-
-      this.channel?.send({ embeds: [embed] }).catch(console.error);
-    }
-  }
-
-  public async playNext() {
-    if (this.queue.length === 0) {
-      this.currentTrack = null;
-      return;
+    public setChannel(channel: TextBasedChannel) {
+        if ('send' in channel) {
+            this.channel = channel as MusicTextChannel;
+        }
     }
 
-    const track = this.queue.shift()!;
-    this.currentTrack = track;
+    public async join(channelId: string, guildId: string, shardId: number = 0) {
+        if (!shoukaku) throw new Error("Music manager not initialized");
+        
+        // Get existing player or create new one
+        const existingPlayer = shoukaku.players.get(guildId);
+        if (existingPlayer) {
+            this.player = existingPlayer;
+            return;
+        }
 
-    try {
-      console.log("[Music] Attempting to stream URL:", track.url);
-      
-      // Use yt-dlp stream directly
-      const stream = getYtdlpStream(track.url);
-      
-      // Use generic resource creation - ffmpeg will probe the input
-      const resource = createAudioResource(stream, {
-        inlineVolume: false,
-      });
+        const node = shoukaku.getNode();
+        if (!node) throw new Error("No Lavalink node available");
 
-      this.player.play(resource);
+        this.player = await node.joinVoiceChannel({
+            guildId: guildId,
+            channelId: channelId,
+            shardId: shardId
+        });
 
-      const embed = new EmbedBuilder()
-        .setColor("#10B981")
-        .setTitle("🎶 Sedang Memutar")
-        .setDescription(`**[${track.title}](${track.url})**`)
-        .setThumbnail(track.thumbnail)
-        .addFields(
-          { name: "Artis", value: track.author, inline: true },
-          { name: "Durasi", value: track.duration, inline: true }
-        )
-        .setFooter({ text: `Diminta oleh ${track.requestedBy}` });
+        this.player.on('start', () => {
+            console.log(`[Music] Track started in ${guildId}`);
+        });
 
-      this.channel?.send({ embeds: [embed] }).catch(console.error);
-    } catch (err: any) {
-      console.error("[Music] Playback Error:", err.message);
-      this.channel?.send(`❌ Gagal memutar lagu: ${err.message}`).catch(console.error);
-      this.playNext();
+        this.player.on('end', () => {
+            console.log(`[Music] Track ended in ${guildId}`);
+            this.playNext();
+        });
+
+        this.player.on('exception', (error: TrackExceptionEvent) => {
+            console.error(`[Music] Track exception:`, error);
+            this.channel?.send(`❌ Error memutar lagu: ${error.exception.message}`).catch(console.error);
+            this.playNext();
+        });
+
+        this.player.on('closed', () => {
+            console.log(`[Music] Player closed in ${guildId}`);
+            this.stop();
+        });
     }
-  }
 
-  public stop() {
-    this.queue = [];
-    this.currentTrack = null;
-    this.player.stop();
-  }
+    public async addToQueue(track: QueueTrack) {
+        this.queue.push(track);
+
+        if (!this.player) {
+            throw new Error("Player not connected. Use join() first.");
+        }
+
+        if (!this.currentTrack && !this.player.track) {
+            await this.playNext();
+        } else {
+            const embed = new EmbedBuilder()
+                .setColor("#5865F2")
+                .setTitle("✅ Menambahkan ke Antrean")
+                .setDescription(`**[${track.info.title}](${track.info.uri})** telah ditambahkan ke antrean.`)
+                .setThumbnail(track.info.thumbnail || "")
+                .addFields(
+                    { name: "Durasi", value: this.formatDuration(track.info.length), inline: true },
+                    { name: "Posisi", value: `#${this.queue.length}`, inline: true }
+                )
+                .setFooter({ text: `Diminta oleh ${track.requestedBy}` });
+
+            this.channel?.send({ embeds: [embed] }).catch(console.error);
+        }
+    }
+
+    public async playNext() {
+        if (!this.player) return;
+
+        if (this.queue.length === 0) {
+            this.currentTrack = null;
+            this.player.stopTrack();
+            return;
+        }
+
+        const track = this.queue.shift()!;
+        this.currentTrack = track;
+
+        await this.player.playTrack({ track: track.track });
+
+        const embed = new EmbedBuilder()
+            .setColor("#10B981")
+            .setTitle("🎶 Sedang Memutar")
+            .setDescription(`**[${track.info.title}](${track.info.uri})**`)
+            .setThumbnail(track.info.thumbnail || "")
+            .addFields(
+                { name: "Artis", value: track.info.author, inline: true },
+                { name: "Durasi", value: this.formatDuration(track.info.length), inline: true }
+            )
+            .setFooter({ text: `Diminta oleh ${track.requestedBy}` });
+
+        this.channel?.send({ embeds: [embed] }).catch(console.error);
+    }
+
+    public stop() {
+        this.queue = [];
+        this.currentTrack = null;
+        if (this.player) {
+            this.player.stopTrack();
+            // Optional: Leave channel on stop? Maybe not, user might want to play another.
+            // But if completely stopping:
+            // shoukaku?.leaveVoiceChannel(this.guildId);
+            // this.player = null;
+        }
+    }
+
+    public leave() {
+        this.stop();
+        if (shoukaku) {
+            shoukaku.leaveVoiceChannel(this.guildId);
+        }
+        this.player = null;
+    }
+
+    private formatDuration(ms: number): string {
+        const minutes = Math.floor(ms / 60000);
+        const seconds = Math.floor((ms % 60000) / 1000);
+        return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }
 }
 
 export class MusicManager {
-  private static managers = new Map<string, GuildMusicManager>();
+    private static managers = new Map<string, GuildMusicManager>();
 
-  public static getManager(guildId: string): GuildMusicManager {
-    let manager = this.managers.get(guildId);
-    if (!manager) {
-      manager = new GuildMusicManager();
-      this.managers.set(guildId, manager);
+    public static getManager(guildId: string): GuildMusicManager {
+        let manager = this.managers.get(guildId);
+        if (!manager) {
+            manager = new GuildMusicManager(guildId);
+            this.managers.set(guildId, manager);
+        }
+        return manager;
     }
-    return manager;
-  }
 
-  public static async search(query: string) {
-    try {
-       // Use yt-dlp for search
-       const results = await searchYtdlp(query);
-       return results;
-    } catch (err: any) {
-      console.error("[Music] Search Error:", err.message);
-      return []; 
+    public static async search(query: string): Promise<QueueTrack[]> {
+        if (!shoukaku) return [];
+        const node = shoukaku.getNode();
+        if (!node) return [];
+
+        const result = await node.rest.resolve(query);
+        if (!result || result.loadType === 'empty' || result.loadType === 'error') return [];
+
+        let tracks = [];
+        if (result.loadType === 'search' || result.loadType === 'track') {
+            tracks = [result.data[0] || result.data]; // Handle single track or search result
+        } else if (result.loadType === 'playlist') {
+            tracks = result.data.tracks;
+        }
+
+        // Handle Lavalink v4 response structure if needed (v4 uses data object)
+        // Shoukaku v4 handles this abstractly usually, but let's be safe.
+        // Actually Shoukaku v4 return type is structured.
+        
+        // Normalize results
+        const rawTracks = Array.isArray(result.data) ? result.data : (result.data as any).tracks || [result.data];
+
+        return rawTracks.map((t: any) => ({
+            track: t.encoded,
+            info: {
+                title: t.info.title,
+                uri: t.info.uri,
+                thumbnail: t.info.artworkUrl || "",
+                length: t.info.length,
+                author: t.info.author
+            },
+            requestedBy: ""
+        }));
     }
-  }
 }
