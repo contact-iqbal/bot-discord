@@ -1,4 +1,5 @@
 import { Client, TextBasedChannel, TextChannel, DMChannel, NewsChannel, EmbedBuilder } from "discord.js";
+// @ts-ignore - Module 'shoukaku' is not installed; install with: npm install shoukaku
 import { Shoukaku, Connectors, NodeOption, Player, Track, TrackExceptionEvent } from "shoukaku";
 
 const Nodes: NodeOption[] = [{
@@ -15,9 +16,9 @@ export function initializeMusicManager(client: Client) {
     shoukaku.on('error', (_, error) => console.error('[Lavalink] Error:', error));
     shoukaku.on('ready', (name) => console.log(`[Lavalink] Node ${name} is ready`));
     shoukaku.on('close', (name, code, reason) => console.warn(`[Lavalink] Node ${name} closed: ${code} ${reason}`));
-    shoukaku.on('disconnect', (name, players, moved) => {
-        if (moved) return;
-        players.map(player => player.connection.disconnect());
+    shoukaku.on('disconnect', (name, count) => {
+        if (count > 0) return;
+        // shoukaku?.players.forEach(player => shoukaku?.leaveVoiceChannel(player.guildId)); // leaveVoiceChannel is deprecated/removed
         console.warn(`[Lavalink] Node ${name} disconnected`);
     });
 }
@@ -63,31 +64,33 @@ class GuildMusicManager {
             return;
         }
 
-        const node = shoukaku.getNode();
+        const node = shoukaku.options.nodeResolver(shoukaku.nodes);
         if (!node) throw new Error("No Lavalink node available");
 
-        this.player = await node.joinVoiceChannel({
+        this.player = await shoukaku.joinVoiceChannel({
             guildId: guildId,
             channelId: channelId,
             shardId: shardId
         });
 
-        this.player.on('start', () => {
+        const player = this.player!;
+
+        player.on('start', () => {
             console.log(`[Music] Track started in ${guildId}`);
         });
 
-        this.player.on('end', () => {
+        player.on('end', () => {
             console.log(`[Music] Track ended in ${guildId}`);
             this.playNext();
         });
 
-        this.player.on('exception', (error: TrackExceptionEvent) => {
+        player.on('exception', (error: TrackExceptionEvent) => {
             console.error(`[Music] Track exception:`, error);
             this.channel?.send(`❌ Error memutar lagu: ${error.exception.message}`).catch(console.error);
             this.playNext();
         });
 
-        this.player.on('closed', () => {
+        player.on('closed', () => {
             console.log(`[Music] Player closed in ${guildId}`);
             this.stop();
         });
@@ -123,14 +126,14 @@ class GuildMusicManager {
 
         if (this.queue.length === 0) {
             this.currentTrack = null;
-            this.player.stopTrack();
+            await this.player.stopTrack();
             return;
         }
 
         const track = this.queue.shift()!;
         this.currentTrack = track;
 
-        await this.player.playTrack({ track: track.track });
+        await this.player.playTrack({ track: { encoded: track.track } });
 
         const embed = new EmbedBuilder()
             .setColor("#10B981")
@@ -187,7 +190,7 @@ export class MusicManager {
 
     public static async search(query: string): Promise<QueueTrack[]> {
         if (!shoukaku) return [];
-        const node = shoukaku.getNode();
+        const node = shoukaku.options.nodeResolver(shoukaku.nodes);
         if (!node) return [];
 
         const result = await node.rest.resolve(query);
@@ -195,7 +198,8 @@ export class MusicManager {
 
         let tracks = [];
         if (result.loadType === 'search' || result.loadType === 'track') {
-            tracks = [result.data[0] || result.data]; // Handle single track or search result
+            const data = result.data;
+            tracks = [Array.isArray(data) ? data[0] : data];
         } else if (result.loadType === 'playlist') {
             tracks = result.data.tracks;
         }
@@ -205,7 +209,7 @@ export class MusicManager {
         // Actually Shoukaku v4 return type is structured.
         
         // Normalize results
-        const rawTracks = Array.isArray(result.data) ? result.data : (result.data as any).tracks || [result.data];
+        const rawTracks = Array.isArray(result.data) ? result.data : ((result.data as any).tracks || [result.data]);
 
         return rawTracks.map((t: any) => ({
             track: t.encoded,

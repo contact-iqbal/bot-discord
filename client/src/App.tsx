@@ -25,7 +25,7 @@ function ProtectedRoute({ component: Component, path }: { component: React.Compo
     return <Redirect to="/login" />;
   }
 
-  return <Route path={path} component={Component} />;
+  return <Route path={path}>{(props) => <Component {...props} />}</Route>;
 }
 
 function Router() {
