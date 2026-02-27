@@ -34,9 +34,9 @@ export function setupAuth(app: Express) {
   passport.use(
     new DiscordStrategy(
       {
-        clientID: "1475678249240494232",
+        clientID: process.env.DISCORD_CLIENT_ID || "1475678249240494232",
         clientSecret: process.env.DISCORD_CLIENT_SECRET || "",
-        callbackURL: process.env.DISCORD_CALLBACK_URL || "http://localhost:5000/api/auth/discord/callback",
+        callbackURL: process.env.DISCORD_CALLBACK_URL || process.env.CALLBACK_URL || "http://localhost:5000/api/auth/discord/callback",
         scope: ["identify", "guilds"],
       },
       async (accessToken, refreshToken, profile, done) => {
