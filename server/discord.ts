@@ -1,6 +1,7 @@
 import { Client, GatewayIntentBits, ActivityType, PresenceStatusData, EmbedBuilder, TextChannel, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, StringSelectMenuBuilder } from "discord.js";
+import { joinVoiceChannel, getVoiceConnection, VoiceConnectionStatus, entersState } from "@discordjs/voice";
 import { storage } from "./storage";
-import { MusicManager, initializeMusicManager } from "./music";
+import { MusicManager } from "./music";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
@@ -72,8 +73,6 @@ export async function startBot(channelId?: string) {
     }
   });
 
-  initializeMusicManager(client);
-
   return new Promise<void>((resolve, reject) => {
     client!.on("messageCreate", async (message) => {
       if (message.author.bot) return;
@@ -128,11 +127,13 @@ export async function startBot(channelId?: string) {
           try {
             await message.channel.send("🔎 Memproses permintaan Anda...").catch(() => {});
 
+            const connection = getVoiceConnection(message.guildId!);
+            const connectPromise = connection
+              ? Promise.resolve()
+              : connectToVoice(voiceChannel.id, voiceChannel.guild.id, voiceChannel.guild.voiceAdapterCreator);
+
             const music = MusicManager.getManager(message.guildId!);
             music.setChannel(message.channel);
-            
-            // Ensure connection to voice channel
-            await music.join(voiceChannel.id, message.guildId!);
 
             // Search and play
             const searchResults = await MusicManager.search(query);
@@ -147,7 +148,8 @@ export async function startBot(channelId?: string) {
               requestedBy: message.author.username,
             };
 
-            await music.addToQueue(track);
+            await connectPromise;
+            await music.addToQueue(track, message.guildId!);
           } catch (err: any) {
             console.error("Play Command Error:", err.message);
             message.reply(`❌ Terjadi kesalahan: ${err.message}`).catch(console.error);
@@ -173,7 +175,7 @@ export async function startBot(channelId?: string) {
             const embed = new EmbedBuilder()
               .setColor("#FF5500")
               .setTitle(`🔍 Hasil Pencarian: ${query}`)
-              .setDescription(results.slice(0, 5).map((r, i) => `**${i + 1}.** [${r.info.title}](${r.info.uri})`).join("\n"))
+              .setDescription(results.slice(0, 5).map((r, i) => `**${i + 1}.** [${r.title}](${r.url})`).join("\n"))
               .setFooter({ text: `Gunakan ${guildPrefix}p [judul] untuk memutar.` });
 
             message.reply({ embeds: [embed] }).catch(console.error);
@@ -198,8 +200,7 @@ export async function startBot(channelId?: string) {
           }
 
           try {
-            const music = MusicManager.getManager(message.guildId!);
-            await music.join(voiceChannel.id, message.guildId!);
+            await connectToVoice(voiceChannel.id, voiceChannel.guild.id, voiceChannel.guild.voiceAdapterCreator);
             message.reply(`Berhasil terhubung ke saluran suara **${voiceChannel.name}**.`).catch(console.error);
           } catch (err: any) {
             message.reply(`Gagal menghubungkan: ${err.message}`).catch(console.error);
@@ -208,8 +209,20 @@ export async function startBot(channelId?: string) {
         }
 
         if (command === "leave") {
-          const music = MusicManager.getManager(message.guildId!);
-          music.leave();
+          const voiceChannel = message.member?.voice.channel;
+          const connection = getVoiceConnection(message.guildId!);
+          
+          if (!connection) {
+            message.reply("Saat ini saya tidak terhubung ke saluran suara mana pun.").catch(console.error);
+            return;
+          }
+
+          if (!voiceChannel || voiceChannel.id !== connection.joinConfig.channelId) {
+            message.reply("Mohon maaf, Anda harus berada di saluran suara yang sama dengan saya untuk memberikan perintah ini.").catch(console.error);
+            return;
+          }
+
+          stopVoiceConnection(message.guildId!);
           message.reply("Koneksi saluran suara telah diputuskan. Sampai jumpa kembali.").catch(console.error);
           return;
         }
@@ -330,7 +343,7 @@ export async function startBot(channelId?: string) {
               { name: `\`${guildPrefix}ping\``, value: "Menampilkan latensi koneksi bot." },
               { name: `\`${guildPrefix}purge [angka]\``, value: "Menghapus sejumlah pesan di saluran teks (Maksimal 100)." },
               { name: `\`${guildPrefix}help\``, value: "Menampilkan panduan bantuan ini." },
-              { name: "Sistem Musik", value: `\`${guildPrefix}play [judul]\` / \`p\`: Memutar musik dari SoundCloud.\n\`${guildPrefix}search [judul]\` / \`s\`: Mencari musik di SoundCloud.\n\`${guildPrefix}stop\` / \`t\`: Menghentikan musik.` }
+              { name: "Sistem Musik", value: `\`${guildPrefix}play [judul]\` / \`p\`: Memutar musik.\n\`${guildPrefix}search [judul]\` / \`s\`: Mencari musik.\n\`${guildPrefix}stop\` / \`t\`: Menghentikan musik.` }
             )
             .addFields({ 
               name: "Informasi Tambahan", 
@@ -362,8 +375,7 @@ export async function startBot(channelId?: string) {
         if (channelId) {
           const channel = await c.channels.fetch(channelId);
           if (channel && channel.isVoiceBased()) {
-             const music = MusicManager.getManager(channel.guild.id);
-             await music.join(channel.id, channel.guild.id);
+            await connectToVoice(channel.id, channel.guild.id, channel.guild.voiceAdapterCreator);
           }
         }
 
@@ -411,6 +423,60 @@ export function updatePresence(settings: { presenceType: string, presenceName: s
     }],
     status: settings.status as PresenceStatusData,
   });
+}
+
+async function connectToVoice(channelId: string, guildId: string, adapterCreator: any, retryCount = 0) {
+  const MAX_RETRIES = 5;
+  const RETRY_DELAY = 5000; // 5 seconds
+
+  try {
+    console.log(`Attempting to join voice channel: ${channelId} (Attempt ${retryCount + 1})`);
+
+    const connection = joinVoiceChannel({
+      channelId,
+      guildId,
+      adapterCreator,
+      selfDeaf: true,
+      selfMute: false,
+    });
+
+    connection.on("stateChange", (oldState, newState) => {
+      console.log(`Voice connection state changed from ${oldState.status} to ${newState.status}`);
+      if (newState.status === VoiceConnectionStatus.Disconnected) {
+        // Handle unexpected disconnect
+        if (retryCount < MAX_RETRIES) {
+          console.log(`Unexpectedly disconnected. Retrying in ${RETRY_DELAY / 1000}s...`);
+          setTimeout(() => connectToVoice(channelId, guildId, adapterCreator, retryCount + 1), RETRY_DELAY);
+        }
+      }
+    });
+
+    connection.on("error", (error) => {
+      console.error("Voice connection error:", error);
+    });
+
+    await entersState(connection, VoiceConnectionStatus.Ready, 15000);
+    console.log(`Successfully connected to voice channel: ${channelId}`);
+  } catch (err: any) {
+    console.error(`Failed to connect to voice channel: ${err.message}`);
+    
+    if (retryCount < MAX_RETRIES) {
+      console.log(`Retrying connection in ${RETRY_DELAY / 1000}s... (${retryCount + 1}/${MAX_RETRIES})`);
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+      return connectToVoice(channelId, guildId, adapterCreator, retryCount + 1);
+    } else {
+      currentStatus = "error";
+      errorMessage = `Gagal menghubungkan ke saluran suara setelah ${MAX_RETRIES} percobaan: ${err.message}`;
+      throw err;
+    }
+  }
+}
+
+function stopVoiceConnection(guildId: string) {
+  const connection = getVoiceConnection(guildId);
+  if (connection) {
+    connection.destroy();
+  }
 }
 
 export function getBotGuilds() {
