@@ -27,11 +27,13 @@ export interface IStorage {
 
 export class DatabaseStorage implements IStorage {
   sessionStore: session.Store;
+  private guildSettingsCache = new Map<string, { settings: GuildSettings, timestamp: number }>();
+  private CACHE_TTL = 1000 * 60 * 5; // 5 menit cache
 
   constructor() {
     this.sessionStore = new PostgresSessionStore({
       pool,
-      createTableIfMissing: false, // Set to false to prevent looking for table.sql
+      createTableIfMissing: false,
       tableName: "session",
     });
   }
@@ -88,26 +90,49 @@ export class DatabaseStorage implements IStorage {
     return updated;
   }
 
-  // Guild Settings
+  // Guild Settings dengan Caching
   async getGuildSettings(guildId: string): Promise<GuildSettings | undefined> {
+    const cached = this.guildSettingsCache.get(guildId);
+    if (cached && (Date.now() - cached.timestamp < this.CACHE_TTL)) {
+      return cached.settings;
+    }
+
     const [settings] = await db.select().from(guildSettings).where(eq(guildSettings.guildId, guildId));
+    
+    if (settings) {
+      this.guildSettingsCache.set(guildId, {
+        settings,
+        timestamp: Date.now()
+      });
+    }
+    
     return settings;
   }
 
   async updateGuildSettings(guildId: string, settings: Partial<InsertGuildSettings>): Promise<GuildSettings> {
     const existing = await this.getGuildSettings(guildId);
+    let updated: GuildSettings;
+
     if (existing) {
-      const [updated] = await db.update(guildSettings)
+      const [res] = await db.update(guildSettings)
         .set(settings)
         .where(eq(guildSettings.guildId, guildId))
         .returning();
-      return updated;
+      updated = res;
     } else {
-      const [inserted] = await db.insert(guildSettings)
-        .values({ guildId, ...settings } as any)
+      const [res] = await db.insert(guildSettings)
+        .values({ ...settings, guildId } as InsertGuildSettings)
         .returning();
-      return inserted;
+      updated = res;
     }
+
+    // Update cache setelah perubahan
+    this.guildSettingsCache.set(guildId, {
+      settings: updated,
+      timestamp: Date.now()
+    });
+
+    return updated;
   }
 }
 

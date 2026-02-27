@@ -64,6 +64,13 @@ export async function startBot(channelId?: string) {
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.MessageContent,
     ],
+    // Optimization: Cache settings
+    sweepers: {
+      messages: {
+        interval: 3600, // Sweep messages every hour
+        lifetime: 1800, // Keep messages for 30 mins
+      }
+    }
   });
 
   return new Promise<void>((resolve, reject) => {
